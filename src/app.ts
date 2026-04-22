@@ -86,11 +86,14 @@ export class RubiCoachApp {
   private scanStableFrames = 0;
   private readonly scanStableTarget = 3;
   private readonly scanAutoQualityThreshold = 0.58;
+  private readonly scanSweepQualityThreshold = 0.56;
   private scanLastSignature = "";
   private scanDetectedFace: Face | null = null;
   private scanLiveColors: ColorKey[] = Array<ColorKey>(9).fill("X");
   private scanLiveCellConfidences: number[] = Array<number>(9).fill(0);
   private scanWarnings: string[] = [];
+  private scanSweepActive = false;
+  private scanSweepBest: Partial<Record<Face, FaceletSample>> = {};
   private scanFrameId = 0;
   private scanFrameTick = 0;
   private scanCaptureCooldown = 0;
@@ -455,6 +458,7 @@ export class RubiCoachApp {
     const liveColors = this.scanCameraActive ? this.scanLiveColors : Array<ColorKey>(9).fill("X");
     const qualityPercent = Math.round(this.scanQuality * 100);
     const qualityLabel = this.scanQuality > 0 ? `${qualityPercent}%` : "-";
+    const sweepCount = this.scanSweepCount();
 
     panel.innerHTML = `
       <div class="panel-scroll" data-panel="photo">
@@ -510,13 +514,34 @@ export class RubiCoachApp {
             </div>
           </section>
           <div class="camera-actions">
-            <button class="primary" type="button" data-action="${this.scanCameraActive ? "capture-camera-face" : "start-scan-camera"}">
+            <button class="primary" type="button" data-action="${this.scanCameraActive ? "capture-camera-face" : "start-scan-camera"}" ${this.scanSweepActive ? "disabled" : ""}>
               ${this.scanCameraActive ? "Capturer" : "Caméra IA"}
             </button>
-            <button type="button" data-action="toggle-auto-capture" ${this.scanCameraActive ? "" : "disabled"}>
+            <button type="button" data-action="toggle-auto-capture" ${this.scanCameraActive && !this.scanSweepActive ? "" : "disabled"}>
               Auto ${this.scanAutoCapture ? "on" : "off"}
             </button>
             <button type="button" data-action="stop-scan-camera" ${this.scanCameraActive ? "" : "disabled"}>Stop</button>
+          </div>
+          <div class="video-sweep ${this.scanSweepActive ? "is-active" : ""}">
+            <button type="button" data-action="toggle-video-sweep">
+              ${this.scanSweepActive ? "Terminer balayage" : "Balayage vidéo"}
+            </button>
+            <div class="video-sweep-status">
+              <span data-sweep-status>${this.scanSweepStatusText()}</span>
+              <div class="video-sweep-faces" aria-label="Faces trouvées en vidéo">
+                ${SCAN_FACE_ORDER.map((face) => {
+                  const sample = this.scanSweepBest[face];
+                  return `
+                    <i
+                      class="${sample ? "is-found" : ""}"
+                      data-sweep-face="${face}"
+                      style="--swatch: ${COLOR_META[FACE_SCAN_COLOR[face]].hex}"
+                      title="${sample ? `${FACE_LABELS[face]} · ${Math.round(sample.quality * 100)}%` : FACE_LABELS[face]}"
+                    >${face}</i>
+                  `;
+                }).join("")}
+              </div>
+            </div>
           </div>
           <div class="scan-quality">
             <span>Fiabilité</span>
@@ -576,7 +601,7 @@ export class RubiCoachApp {
 
         <section class="principle-band">
           <strong>${escapeHtml(validation.message)}</strong>
-          <p>${escapeHtml(this.scanMessage)}</p>
+          <p data-scan-message>${escapeHtml(this.scanMessage)}</p>
         </section>
 
         <div class="coach-actions scanner-actions">
@@ -591,6 +616,7 @@ export class RubiCoachApp {
         <section class="checkpoints">
           <strong>Mobile</strong>
           <p>Sur téléphone, Caméra IA ouvre la caméra arrière quand le navigateur l'autorise.</p>
+          <p>Balayage vidéo garde la meilleure vue de chaque face selon la couleur du centre.</p>
           <p>Si le cube est trop loin ou trop près, change Cadre avant de capturer.</p>
           <p>Si une face arrive de travers, tourne la grille avant d'appliquer au cube 3D.</p>
           <p>Une seule photo ne suffit pas: il faut les 6 faces.</p>
@@ -715,6 +741,9 @@ export class RubiCoachApp {
         break;
       case "capture-camera-face":
         this.captureCameraFace();
+        break;
+      case "toggle-video-sweep":
+        void this.toggleVideoSweep();
         break;
       case "toggle-auto-capture":
         this.scanAutoCapture = !this.scanAutoCapture;
@@ -1081,6 +1110,8 @@ export class RubiCoachApp {
     this.scanQuality = 0;
     this.scanWarnings = [];
     this.scanDetectedFace = null;
+    this.scanSweepActive = false;
+    this.scanSweepBest = {};
     this.scanMessage = "Exemple résolu rempli. Tu peux l'appliquer pour vérifier le rendu.";
     this.render();
   }
@@ -1096,6 +1127,8 @@ export class RubiCoachApp {
     this.scanLiveColors = Array<ColorKey>(9).fill("X");
     this.scanLiveCellConfidences = Array<number>(9).fill(0);
     this.scanWarnings = [];
+    this.scanSweepActive = false;
+    this.scanSweepBest = {};
     this.scanMessage = "Scan vidé. Les centres restent verrouillés.";
     this.render();
   }
@@ -1152,6 +1185,8 @@ export class RubiCoachApp {
   }
 
   private stopScanCamera(): void {
+    const wasSweeping = this.scanSweepActive;
+
     if (this.scanFrameId) {
       window.cancelAnimationFrame(this.scanFrameId);
       this.scanFrameId = 0;
@@ -1163,8 +1198,13 @@ export class RubiCoachApp {
     this.scanStableFrames = 0;
     this.scanLastSignature = "";
     this.scanDetectedFace = null;
+    this.scanSweepActive = false;
     this.scanLiveColors = Array<ColorKey>(9).fill("X");
     this.scanLiveCellConfidences = Array<number>(9).fill(0);
+
+    if (wasSweeping) {
+      this.scanMessage = `Balayage vidéo arrêté: ${this.scanSweepCount()}/6 faces gardées.`;
+    }
   }
 
   private attachCameraVideo(): void {
@@ -1224,6 +1264,9 @@ export class RubiCoachApp {
       this.scanLiveCellConfidences = sample.cellConfidences;
       this.scanDetectedFace =
         sample.centerConfidence >= 0.48 ? (FACE_BY_CENTER_COLOR[sample.centerColor] ?? null) : null;
+      if (this.scanSweepActive) {
+        this.collectSweepSample(sample);
+      }
       const stable =
         this.scanSignatureDistance(signature, this.scanLastSignature) <= 1 &&
         this.isSampleAutoReady(sample);
@@ -1258,6 +1301,7 @@ export class RubiCoachApp {
     const quality = this.root.querySelector<HTMLElement>("[data-scan-quality]");
     const qualityBar = this.root.querySelector<HTMLElement>("[data-scan-quality-bar]");
     const warnings = this.root.querySelector<HTMLElement>("[data-scan-warnings]");
+    const message = this.root.querySelector<HTMLElement>("[data-scan-message]");
 
     if (confidence) {
       confidence.textContent = `${Math.round(this.scanQuality * 100)}%`;
@@ -1281,6 +1325,12 @@ export class RubiCoachApp {
         .join("");
     }
 
+    if (message) {
+      message.textContent = this.scanMessage;
+    }
+
+    this.updateSweepStatusDom();
+
     this.root.querySelectorAll<HTMLElement>(".camera-grid i").forEach((cell, index) => {
       const color = this.scanLiveColors[index] ?? "X";
       const confidence = this.scanLiveCellConfidences[index] ?? 0;
@@ -1292,14 +1342,138 @@ export class RubiCoachApp {
   }
 
   private isSampleAutoReady(sample: FaceletSample): boolean {
-    const centerFace = FACE_BY_CENTER_COLOR[sample.centerColor];
+    const centerFace = this.detectFaceFromCenter(sample);
 
     return Boolean(
       centerFace &&
-        sample.centerConfidence >= 0.48 &&
         sample.quality >= this.scanAutoQualityThreshold &&
         sample.colors.every((color) => color !== "X"),
     );
+  }
+
+  private collectSweepSample(sample: FaceletSample): void {
+    const face = this.detectFaceFromCenter(sample);
+
+    if (
+      !face ||
+      sample.quality < this.scanSweepQualityThreshold ||
+      sample.colors.some((color) => color === "X")
+    ) {
+      return;
+    }
+
+    const current = this.scanSweepBest[face];
+
+    if (current && current.quality >= sample.quality - 0.025) {
+      return;
+    }
+
+    this.scanSweepBest = {
+      ...this.scanSweepBest,
+      [face]: sample,
+    };
+    this.scanMessage = `Face ${face} gardée en vidéo (${Math.round(sample.quality * 100)}%). Continue à tourner le cube.`;
+    this.updateSweepStatusDom();
+
+    if (this.scanSweepCount() === SCAN_FACE_ORDER.length) {
+      this.finishVideoSweep(true);
+    }
+  }
+
+  private async toggleVideoSweep(): Promise<void> {
+    if (this.scanSweepActive) {
+      this.finishVideoSweep(false);
+      return;
+    }
+
+    await this.startVideoSweep();
+  }
+
+  private async startVideoSweep(): Promise<void> {
+    if (!this.scanCameraActive) {
+      await this.startScanCamera();
+    }
+
+    if (!this.scanCameraActive) {
+      return;
+    }
+
+    this.scanSweepActive = true;
+    this.scanSweepBest = {};
+    this.scanAutoCapture = false;
+    this.scanStableFrames = 0;
+    this.scanCaptureCooldown = 0;
+    this.scanMessage = "Balayage vidéo actif: montre chaque face bien à plat une seconde.";
+    this.render();
+  }
+
+  private finishVideoSweep(completed: boolean): void {
+    const foundFaces = SCAN_FACE_ORDER.filter((face) => this.scanSweepBest[face]);
+
+    this.scanSweepActive = false;
+    this.scanAutoCapture = false;
+
+    if (foundFaces.length === 0) {
+      this.scanMessage = "Balayage terminé sans face fiable. Rapproche le cube ou améliore la lumière.";
+      this.render();
+      return;
+    }
+
+    const nextGrid = cloneScanGrid(this.scanGrid);
+
+    foundFaces.forEach((face) => {
+      const sample = this.scanSweepBest[face];
+
+      if (!sample) {
+        return;
+      }
+
+      nextGrid[face] = this.faceColorsFromSample(sample, face);
+      this.scanPhotos[face] = sample.dataUrl;
+    });
+
+    this.scanGrid = nextGrid;
+    this.scanFace = this.nextIncompleteScanFace(foundFaces[foundFaces.length - 1]);
+    this.scanPaint = FACE_SCAN_COLOR[this.scanFace];
+    this.scanMessage = completed
+      ? "Balayage vidéo terminé: les 6 faces ont été placées. Corrige l'orientation si besoin."
+      : `Balayage appliqué: ${foundFaces.length}/6 faces placées. Continue avec les faces manquantes.`;
+    this.render();
+  }
+
+  private updateSweepStatusDom(): void {
+    const status = this.root.querySelector<HTMLElement>("[data-sweep-status]");
+
+    if (status) {
+      status.textContent = this.scanSweepStatusText();
+    }
+
+    SCAN_FACE_ORDER.forEach((face) => {
+      const marker = this.root.querySelector<HTMLElement>(`[data-sweep-face="${face}"]`);
+      const sample = this.scanSweepBest[face];
+
+      if (!marker) {
+        return;
+      }
+
+      marker.classList.toggle("is-found", Boolean(sample));
+      marker.title = sample
+        ? `${FACE_LABELS[face]} · ${Math.round(sample.quality * 100)}%`
+        : FACE_LABELS[face];
+    });
+  }
+
+  private scanSweepStatusText(): string {
+    if (this.scanSweepActive) {
+      return `Balayage actif · ${this.scanSweepCount()}/6`;
+    }
+
+    const count = this.scanSweepCount();
+    return count > 0 ? `${count}/6 faces vidéo prêtes` : "Tourne le cube devant la caméra";
+  }
+
+  private scanSweepCount(): number {
+    return SCAN_FACE_ORDER.filter((face) => this.scanSweepBest[face]).length;
   }
 
   private scanSignatureDistance(next: string, previous: string): number {
@@ -1333,8 +1507,7 @@ export class RubiCoachApp {
   private commitScanSample(sample: FaceletSample, sourceLabel: string, auto: boolean): void {
     const targetFace = this.resolveSampleTargetFace(sample);
     const routed = targetFace !== this.scanFace;
-    const colors = [...sample.colors];
-    colors[4] = FACE_SCAN_COLOR[targetFace];
+    const colors = this.faceColorsFromSample(sample, targetFace);
     const nextGrid = cloneScanGrid(this.scanGrid);
     nextGrid[targetFace] = colors;
     this.scanGrid = nextGrid;
@@ -1366,13 +1539,27 @@ export class RubiCoachApp {
   }
 
   private resolveSampleTargetFace(sample: FaceletSample): Face {
-    const detectedFace = FACE_BY_CENTER_COLOR[sample.centerColor];
+    const detectedFace = this.detectFaceFromCenter(sample);
 
-    if (detectedFace && sample.centerConfidence >= 0.5) {
+    if (detectedFace) {
       return detectedFace;
     }
 
     return this.scanFace;
+  }
+
+  private detectFaceFromCenter(sample: FaceletSample): Face | null {
+    if (sample.centerConfidence < 0.5) {
+      return null;
+    }
+
+    return FACE_BY_CENTER_COLOR[sample.centerColor] ?? null;
+  }
+
+  private faceColorsFromSample(sample: FaceletSample, targetFace: Face): ColorKey[] {
+    const colors = [...sample.colors];
+    colors[4] = FACE_SCAN_COLOR[targetFace];
+    return colors;
   }
 
   private scanFrameInset(): string {

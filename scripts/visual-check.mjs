@@ -82,6 +82,8 @@ try {
         mirrorTool: Boolean(document.querySelector('[data-action="mirror-scan-face"]')),
         quality: Boolean(document.querySelector("[data-scan-quality]")),
         qualityBar: Boolean(document.querySelector("[data-scan-quality-bar]")),
+        videoSweep: Boolean(document.querySelector('[data-action="toggle-video-sweep"]')),
+        sweepFaces: document.querySelectorAll("[data-sweep-face]").length,
         capture: input instanceof HTMLInputElement ? input.getAttribute("capture") : null,
         accept: input instanceof HTMLInputElement ? input.accept : null,
       };
@@ -96,6 +98,8 @@ try {
       !scanner.mirrorTool ||
       !scanner.quality ||
       !scanner.qualityBar ||
+      !scanner.videoSweep ||
+      scanner.sweepFaces !== 6 ||
       scanner.capture !== "environment" ||
       scanner.accept !== "image/*"
     ) {
@@ -135,6 +139,7 @@ try {
       ),
       inset: getComputedStyle(document.querySelector(".camera-grid")).inset,
       hasCapture: Boolean(document.querySelector('[data-action="capture-camera-face"]')),
+      hasSweep: Boolean(document.querySelector('[data-action="toggle-video-sweep"]')),
       hasStop: Boolean(document.querySelector('[data-action="stop-scan-camera"]')),
     }));
 
@@ -143,11 +148,30 @@ try {
       !cameraUi.liveCells ||
       !cameraUi.inset ||
       !cameraUi.hasCapture ||
+      !cameraUi.hasSweep ||
       !cameraUi.hasStop
     ) {
       throw new Error(`${viewport.name}: scanner caméra incomplet ${JSON.stringify(cameraUi)}`);
     }
 
+    await page.click('[data-action="toggle-video-sweep"]');
+    await page.waitForSelector(".video-sweep.is-active");
+    const sweepActive = await page.evaluate(() => ({
+      status: document.querySelector("[data-sweep-status]")?.textContent ?? "",
+      autoDisabled: document.querySelector('[data-action="toggle-auto-capture"]')?.hasAttribute("disabled"),
+      captureDisabled: document.querySelector('[data-action="capture-camera-face"]')?.hasAttribute("disabled"),
+    }));
+
+    if (
+      !sweepActive.status.includes("Balayage actif") ||
+      !sweepActive.autoDisabled ||
+      !sweepActive.captureDisabled
+    ) {
+      throw new Error(`${viewport.name}: balayage vidéo inactif ${JSON.stringify(sweepActive)}`);
+    }
+
+    await page.click('[data-action="toggle-video-sweep"]');
+    await page.waitForFunction(() => !document.querySelector(".video-sweep")?.classList.contains("is-active"));
     await page.click('[data-action="capture-camera-face"]');
     await page.waitForFunction(() =>
       document.querySelector('[data-action="toggle-auto-capture"]')?.textContent?.includes("off"),
