@@ -7,7 +7,10 @@ const viewports = [
   { name: "mobile", width: 390, height: 844 },
 ];
 
-const browser = await chromium.launch({ headless: true });
+const browser = await chromium.launch({
+  headless: true,
+  args: ["--use-fake-device-for-media-stream", "--use-fake-ui-for-media-stream"],
+});
 
 try {
   for (const viewport of viewports) {
@@ -74,6 +77,11 @@ try {
         tabs: document.querySelectorAll(".scan-face-tabs button").length,
         cells: document.querySelectorAll(".scan-grid button").length,
         palette: document.querySelectorAll(".scan-palette button").length,
+        frameTools: document.querySelectorAll('[data-action="set-scan-frame"]').length,
+        rotateTools: document.querySelectorAll('[data-action="rotate-scan-face"]').length,
+        mirrorTool: Boolean(document.querySelector('[data-action="mirror-scan-face"]')),
+        quality: Boolean(document.querySelector("[data-scan-quality]")),
+        qualityBar: Boolean(document.querySelector("[data-scan-quality-bar]")),
         capture: input instanceof HTMLInputElement ? input.getAttribute("capture") : null,
         accept: input instanceof HTMLInputElement ? input.accept : null,
       };
@@ -83,12 +91,77 @@ try {
       scanner.tabs !== 6 ||
       scanner.cells !== 9 ||
       scanner.palette < 7 ||
+      scanner.frameTools !== 3 ||
+      scanner.rotateTools !== 2 ||
+      !scanner.mirrorTool ||
+      !scanner.quality ||
+      !scanner.qualityBar ||
       scanner.capture !== "environment" ||
       scanner.accept !== "image/*"
     ) {
       throw new Error(`${viewport.name}: scanner photo incomplet ${JSON.stringify(scanner)}`);
     }
 
+    const scrollPreserved = await page.evaluate(() => {
+      const scroll = document.querySelector(".coach-panel .panel-scroll");
+      const action = document.querySelector('[data-action="mirror-scan-face"]');
+
+      if (!(scroll instanceof HTMLElement) || !(action instanceof HTMLElement)) {
+        return { ok: false, before: 0, after: 0 };
+      }
+
+      scroll.scrollTop = 240;
+      const before = scroll.scrollTop;
+      action.click();
+      const nextScroll = document.querySelector(".coach-panel .panel-scroll");
+      const after = nextScroll instanceof HTMLElement ? nextScroll.scrollTop : 0;
+
+      return { ok: Math.abs(before - after) <= 2, before, after };
+    });
+
+    if (!scrollPreserved.ok) {
+      throw new Error(`${viewport.name}: scroll scanner non préservé ${JSON.stringify(scrollPreserved)}`);
+    }
+
+    await page.click('[data-action="set-scan-frame"][data-scale="0.54"]');
+    await page.click('[data-action="rotate-scan-face"][data-direction="right"]');
+    await page.click('[data-action="mirror-scan-face"]');
+    await page.click('[data-action="start-scan-camera"]');
+    await page.waitForSelector(".scan-video");
+    const cameraUi = await page.evaluate(() => ({
+      grid: document.querySelectorAll(".camera-grid i").length,
+      liveCells: [...document.querySelectorAll(".camera-grid i")].every((cell) =>
+        cell instanceof HTMLElement && cell.style.getPropertyValue("--live-color"),
+      ),
+      inset: getComputedStyle(document.querySelector(".camera-grid")).inset,
+      hasCapture: Boolean(document.querySelector('[data-action="capture-camera-face"]')),
+      hasStop: Boolean(document.querySelector('[data-action="stop-scan-camera"]')),
+    }));
+
+    if (
+      cameraUi.grid !== 9 ||
+      !cameraUi.liveCells ||
+      !cameraUi.inset ||
+      !cameraUi.hasCapture ||
+      !cameraUi.hasStop
+    ) {
+      throw new Error(`${viewport.name}: scanner caméra incomplet ${JSON.stringify(cameraUi)}`);
+    }
+
+    await page.click('[data-action="capture-camera-face"]');
+    await page.waitForFunction(() =>
+      document.querySelector('[data-action="toggle-auto-capture"]')?.textContent?.includes("off"),
+    );
+    const validatedFace = await page.evaluate(() => ({
+      auto: document.querySelector('[data-action="toggle-auto-capture"]')?.textContent?.trim() ?? "",
+      message: document.querySelector(".principle-band p")?.textContent ?? "",
+    }));
+
+    if (!validatedFace.auto.includes("off") || !validatedFace.message.includes("Capture")) {
+      throw new Error(`${viewport.name}: capture auto non stoppée ${JSON.stringify(validatedFace)}`);
+    }
+
+    await page.click('[data-action="stop-scan-camera"]');
     await page.click('[data-action="fill-solved-scan"]');
     await page.waitForSelector(".scan-counts .is-valid");
     await page.click('[data-action="apply-scan"]');

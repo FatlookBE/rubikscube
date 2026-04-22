@@ -10,12 +10,17 @@ import {
   COLOR_META,
   ColorKey,
   FACE_SCAN_COLOR,
+  FaceletSample,
   SCAN_FACE_ORDER,
   ScanGrid,
   cloneScanGrid,
   createEmptyScanGrid,
   createSolvedScanGrid,
+  mirrorFaceCells,
+  rotateFaceCellsClockwise,
+  rotateFaceCellsCounterClockwise,
   sampleFaceletsFromImage,
+  sampleFaceletsFromVideo,
   scanGridToHexConfig,
   validateScanGrid,
 } from "./photo-scanner";
@@ -41,6 +46,15 @@ const FACE_LABELS: Record<Face, string> = {
 };
 
 const STORAGE_KEY = "rubi-coach-known-lessons";
+const SCAN_FRAME_OPTIONS = [
+  { label: "Loin", scale: 0.54 },
+  { label: "Normal", scale: 0.68 },
+  { label: "Près", scale: 0.82 },
+] as const;
+const FACE_BY_CENTER_COLOR = SCAN_FACE_ORDER.reduce((map, face) => {
+  map[FACE_SCAN_COLOR[face]] = face;
+  return map;
+}, {} as Partial<Record<ColorKey, Face>>);
 
 export class RubiCoachApp {
   private readonly root: HTMLElement;
@@ -63,6 +77,23 @@ export class RubiCoachApp {
   private scanPaint: ColorKey = "W";
   private scanPhotos: Partial<Record<Face, string>> = {};
   private scanMessage = "Scanne ou corrige les 6 faces.";
+  private scanFrameScale = 0.68;
+  private scanCameraStream?: MediaStream;
+  private scanCameraActive = false;
+  private scanAutoCapture = true;
+  private scanConfidence = 0;
+  private scanQuality = 0;
+  private scanStableFrames = 0;
+  private readonly scanStableTarget = 3;
+  private readonly scanAutoQualityThreshold = 0.58;
+  private scanLastSignature = "";
+  private scanDetectedFace: Face | null = null;
+  private scanLiveColors: ColorKey[] = Array<ColorKey>(9).fill("X");
+  private scanLiveCellConfidences: number[] = Array<number>(9).fill(0);
+  private scanWarnings: string[] = [];
+  private scanFrameId = 0;
+  private scanFrameTick = 0;
+  private scanCaptureCooldown = 0;
   private readonly knownLessons = new Set<string>();
 
   constructor(root: HTMLElement) {
@@ -104,9 +135,27 @@ export class RubiCoachApp {
   }
 
   private render(): void {
+    const previousScrollTop = this.mode === "photo" ? this.getPanelScrollTop() : null;
+    this.syncShellState();
     this.renderTopHud();
     this.renderCoachPanel();
     this.renderMovePad();
+    this.attachCameraVideo();
+
+    if (previousScrollTop !== null) {
+      this.restorePanelScroll(previousScrollTop);
+    }
+  }
+
+  private syncShellState(): void {
+    const shell = this.root.querySelector<HTMLElement>(".app-shell");
+
+    if (!shell) {
+      return;
+    }
+
+    shell.classList.toggle("is-photo-mode", this.mode === "photo");
+    shell.classList.toggle("is-adaptive-mode", this.mode === "adaptive");
   }
 
   private renderTopHud(): void {
@@ -250,6 +299,23 @@ export class RubiCoachApp {
     `;
   }
 
+  private getPanelScrollTop(): number | null {
+    return this.root.querySelector<HTMLElement>('.coach-panel .panel-scroll[data-panel="photo"]')
+      ?.scrollTop ?? null;
+  }
+
+  private restorePanelScroll(scrollTop: number): void {
+    const scroll = this.root.querySelector<HTMLElement>(
+      '.coach-panel .panel-scroll[data-panel="photo"]',
+    );
+
+    if (!scroll) {
+      return;
+    }
+
+    scroll.scrollTop = Math.min(scrollTop, Math.max(0, scroll.scrollHeight - scroll.clientHeight));
+  }
+
   private renderModeRow(): string {
     return `
       <div class="mode-row" role="group" aria-label="Mode d'entraînement">
@@ -386,9 +452,12 @@ export class RubiCoachApp {
     const faceColor = FACE_SCAN_COLOR[this.scanFace];
     const cells = this.scanGrid[this.scanFace];
     const photo = this.scanPhotos[this.scanFace];
+    const liveColors = this.scanCameraActive ? this.scanLiveColors : Array<ColorKey>(9).fill("X");
+    const qualityPercent = Math.round(this.scanQuality * 100);
+    const qualityLabel = this.scanQuality > 0 ? `${qualityPercent}%` : "-";
 
     panel.innerHTML = `
-      <div class="panel-scroll">
+      <div class="panel-scroll" data-panel="photo">
         <div class="lesson-header">
           <span class="eyebrow">Photo</span>
           <h1>Scanner le cube</h1>
@@ -402,6 +471,7 @@ export class RubiCoachApp {
               <button class="${face === this.scanFace ? "is-active" : ""} ${done ? "is-done" : ""}" type="button" data-action="select-scan-face" data-face="${face}">
                 <span>${face}</span>
                 <small>${COLOR_META[FACE_SCAN_COLOR[face]].label}</small>
+                ${done ? "<em>OK</em>" : ""}
               </button>
             `;
           }).join("")}
@@ -413,8 +483,60 @@ export class RubiCoachApp {
             <strong>${this.scanFace} · ${COLOR_META[faceColor].label}</strong>
           </div>
           <div>
-            <span>Validation</span>
-            <strong>${validation.valid ? "OK" : validation.complete ? "À corriger" : "Incomplet"}</strong>
+            <span>Fiabilité vision</span>
+            <strong data-scan-confidence>${this.scanCameraActive ? qualityLabel : validation.valid ? "OK" : this.scanQuality > 0 ? qualityLabel : validation.complete ? "À corriger" : "Incomplet"}</strong>
+          </div>
+        </section>
+
+        <section class="camera-scanner">
+          <div class="camera-title">
+            <strong>Assistant vision</strong>
+            <span data-scan-stability>${this.scanCameraActive ? `${this.scanDetectedFace ? `${this.scanDetectedFace} · ` : ""}${this.scanStableFrames}/${this.scanStableTarget} stable` : "caméra mobile"}</span>
+          </div>
+          <section class="scan-tools" aria-label="Réglages du scanner">
+            <div class="scan-tool-group">
+              <span>Cadre</span>
+              ${SCAN_FRAME_OPTIONS.map((option) => `
+                <button class="${Math.abs(this.scanFrameScale - option.scale) < 0.01 ? "is-active" : ""}" type="button" data-action="set-scan-frame" data-scale="${option.scale}">
+                  ${option.label}
+                </button>
+              `).join("")}
+            </div>
+            <div class="scan-tool-group">
+              <span>Orientation</span>
+              <button type="button" data-action="rotate-scan-face" data-direction="left" aria-label="Tourner la face vers la gauche">↺</button>
+              <button type="button" data-action="rotate-scan-face" data-direction="right" aria-label="Tourner la face vers la droite">↻</button>
+              <button type="button" data-action="mirror-scan-face">Miroir</button>
+            </div>
+          </section>
+          <div class="camera-actions">
+            <button class="primary" type="button" data-action="${this.scanCameraActive ? "capture-camera-face" : "start-scan-camera"}">
+              ${this.scanCameraActive ? "Capturer" : "Caméra IA"}
+            </button>
+            <button type="button" data-action="toggle-auto-capture" ${this.scanCameraActive ? "" : "disabled"}>
+              Auto ${this.scanAutoCapture ? "on" : "off"}
+            </button>
+            <button type="button" data-action="stop-scan-camera" ${this.scanCameraActive ? "" : "disabled"}>Stop</button>
+          </div>
+          <div class="scan-quality">
+            <span>Fiabilité</span>
+            <div class="scan-quality-track"><i data-scan-quality-bar style="width: ${qualityPercent}%"></i></div>
+            <strong data-scan-quality>${qualityLabel}</strong>
+          </div>
+          <div class="scan-warning-row" data-scan-warnings>
+            ${this.scanWarnings.map((warning) => `<span>${escapeHtml(warning)}</span>`).join("")}
+          </div>
+          <div class="camera-frame ${this.scanCameraActive ? "is-live" : ""}">
+            ${this.scanCameraActive ? `<video class="scan-video" autoplay muted playsinline></video>` : `<span>Active la caméra, centre une face dans la grille, puis laisse l'app capturer.</span>`}
+            <div class="camera-grid" style="--scan-inset: ${this.scanFrameInset()}" aria-hidden="true">
+              ${liveColors.map((color, index) => `
+                <i
+                  class="${this.scanLiveCellConfidences[index] > 0 && this.scanLiveCellConfidences[index] < 0.42 ? "is-weak" : ""}"
+                  style="--live-color: ${COLOR_META[color].hex}; --live-opacity: ${color === "X" ? 0 : 0.72}"
+                  data-label="${color === "X" ? "" : COLOR_META[color].short}"
+                ></i>
+              `).join("")}
+            </div>
           </div>
         </section>
 
@@ -468,8 +590,9 @@ export class RubiCoachApp {
 
         <section class="checkpoints">
           <strong>Mobile</strong>
-          <p>Sur téléphone, le bouton Photo / caméra ouvre la caméra arrière quand le navigateur l'autorise.</p>
-          <p>Cadre la face le plus à plat possible, puis corrige les 9 cases avec la palette.</p>
+          <p>Sur téléphone, Caméra IA ouvre la caméra arrière quand le navigateur l'autorise.</p>
+          <p>Si le cube est trop loin ou trop près, change Cadre avant de capturer.</p>
+          <p>Si une face arrive de travers, tourne la grille avant d'appliquer au cube 3D.</p>
           <p>Une seule photo ne suffit pas: il faut les 6 faces.</p>
         </section>
       </div>
@@ -562,8 +685,17 @@ export class RubiCoachApp {
       case "paint-scan-cell":
         this.paintScanCell(Number(target.dataset.index ?? 0));
         break;
+      case "set-scan-frame":
+        this.setScanFrameScale(Number(target.dataset.scale ?? this.scanFrameScale));
+        break;
+      case "rotate-scan-face":
+        this.rotateScanFace(target.dataset.direction === "left" ? "left" : "right");
+        break;
+      case "mirror-scan-face":
+        this.mirrorScanFace();
+        break;
       case "next-scan-face":
-        this.selectScanFace(this.nextScanFace());
+        this.selectScanFace(this.nextIncompleteScanFace());
         break;
       case "fill-solved-scan":
         this.fillSolvedScan();
@@ -573,6 +705,23 @@ export class RubiCoachApp {
         break;
       case "apply-scan":
         this.applyScanToCube();
+        break;
+      case "start-scan-camera":
+        void this.startScanCamera();
+        break;
+      case "stop-scan-camera":
+        this.stopScanCamera();
+        this.render();
+        break;
+      case "capture-camera-face":
+        this.captureCameraFace();
+        break;
+      case "toggle-auto-capture":
+        this.scanAutoCapture = !this.scanAutoCapture;
+        this.scanMessage = this.scanAutoCapture
+          ? "Auto-capture active: stabilise une face dans la grille."
+          : "Auto-capture coupée. Utilise Capturer.";
+        this.render();
         break;
       case "new-challenge":
         this.challenge = randomMove(this.challenge[0] as Face);
@@ -628,18 +777,12 @@ export class RubiCoachApp {
     this.render();
 
     try {
-      const result = await sampleFaceletsFromImage(file);
-      const nextGrid = cloneScanGrid(this.scanGrid);
-      nextGrid[this.scanFace] = result.colors;
-      nextGrid[this.scanFace][4] = FACE_SCAN_COLOR[this.scanFace];
-      this.scanGrid = nextGrid;
-      this.scanPhotos[this.scanFace] = result.dataUrl;
-      this.scanMessage = "Détection appliquée. Corrige les cases si besoin.";
+      const result = await sampleFaceletsFromImage(file, { frameScale: this.scanFrameScale });
+      this.commitScanSample(result, "Photo", false);
     } catch (error) {
       this.scanMessage = error instanceof Error ? error.message : "Photo impossible à analyser.";
+      this.render();
     }
-
-    this.render();
   }
 
   private handleKeyDown(event: KeyboardEvent): void {
@@ -691,6 +834,10 @@ export class RubiCoachApp {
 
     this.mode = mode === "adaptive" || mode === "photo" || mode === "free" ? mode : "guide";
     this.practiceIndex = 0;
+
+    if (this.mode !== "photo") {
+      this.stopScanCamera();
+    }
 
     if (this.mode === "adaptive") {
       this.explanationOpen = true;
@@ -886,9 +1033,54 @@ export class RubiCoachApp {
     this.render();
   }
 
+  private setScanFrameScale(scale: number): void {
+    if (!Number.isFinite(scale)) {
+      return;
+    }
+
+    this.scanFrameScale = clampNumber(scale, 0.48, 0.88);
+    this.scanStableFrames = 0;
+    this.scanLastSignature = "";
+    this.scanMessage =
+      this.scanFrameScale < 0.6
+        ? "Cadre réduit: utile quand le cube ne remplit pas tout l'écran."
+        : this.scanFrameScale > 0.76
+          ? "Cadre large: utile quand tu peux rapprocher le cube."
+          : "Cadre normal: aligne une face avec la grille.";
+    this.render();
+  }
+
+  private rotateScanFace(direction: "left" | "right"): void {
+    const current = this.scanGrid[this.scanFace];
+    const transformed =
+      direction === "left"
+        ? rotateFaceCellsCounterClockwise(current)
+        : rotateFaceCellsClockwise(current);
+
+    this.replaceActiveScanFace(transformed);
+    this.scanMessage = `Face ${this.scanFace} tournée ${direction === "left" ? "à gauche" : "à droite"}.`;
+    this.render();
+  }
+
+  private mirrorScanFace(): void {
+    this.replaceActiveScanFace(mirrorFaceCells(this.scanGrid[this.scanFace]));
+    this.scanMessage = `Face ${this.scanFace} retournée en miroir.`;
+    this.render();
+  }
+
+  private replaceActiveScanFace(cells: ColorKey[]): void {
+    const nextGrid = cloneScanGrid(this.scanGrid);
+    nextGrid[this.scanFace] = [...cells];
+    nextGrid[this.scanFace][4] = FACE_SCAN_COLOR[this.scanFace];
+    this.scanGrid = nextGrid;
+  }
+
   private fillSolvedScan(): void {
     this.scanGrid = createSolvedScanGrid();
     this.scanPhotos = {};
+    this.scanQuality = 0;
+    this.scanWarnings = [];
+    this.scanDetectedFace = null;
     this.scanMessage = "Exemple résolu rempli. Tu peux l'appliquer pour vérifier le rendu.";
     this.render();
   }
@@ -896,6 +1088,14 @@ export class RubiCoachApp {
   private resetScan(): void {
     this.scanGrid = createEmptyScanGrid();
     this.scanPhotos = {};
+    this.scanConfidence = 0;
+    this.scanQuality = 0;
+    this.scanStableFrames = 0;
+    this.scanLastSignature = "";
+    this.scanDetectedFace = null;
+    this.scanLiveColors = Array<ColorKey>(9).fill("X");
+    this.scanLiveCellConfidences = Array<number>(9).fill(0);
+    this.scanWarnings = [];
     this.scanMessage = "Scan vidé. Les centres restent verrouillés.";
     this.render();
   }
@@ -916,6 +1116,281 @@ export class RubiCoachApp {
     this.status = "Configuration photo appliquée au cube 3D.";
     this.scanMessage = "Le cube 3D reprend les couleurs scannées. Le solveur photo complet reste à brancher.";
     this.render();
+  }
+
+  private async startScanCamera(): Promise<void> {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      this.scanMessage = "Caméra indisponible dans ce navigateur.";
+      this.render();
+      return;
+    }
+
+    try {
+      this.stopScanCamera();
+      this.scanCameraStream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: {
+          facingMode: { ideal: "environment" },
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+        },
+      });
+      this.scanCameraActive = true;
+      this.scanStableFrames = 0;
+      this.scanLastSignature = "";
+      this.scanCaptureCooldown = 0;
+      this.scanMessage = "Centre une seule face dans la grille. L'auto-capture part quand c'est stable.";
+      this.render();
+      this.startScanLoop();
+    } catch (error) {
+      this.scanMessage =
+        error instanceof Error
+          ? `Caméra refusée ou indisponible: ${error.message}`
+          : "Caméra refusée ou indisponible.";
+      this.render();
+    }
+  }
+
+  private stopScanCamera(): void {
+    if (this.scanFrameId) {
+      window.cancelAnimationFrame(this.scanFrameId);
+      this.scanFrameId = 0;
+    }
+
+    this.scanCameraStream?.getTracks().forEach((track) => track.stop());
+    this.scanCameraStream = undefined;
+    this.scanCameraActive = false;
+    this.scanStableFrames = 0;
+    this.scanLastSignature = "";
+    this.scanDetectedFace = null;
+    this.scanLiveColors = Array<ColorKey>(9).fill("X");
+    this.scanLiveCellConfidences = Array<number>(9).fill(0);
+  }
+
+  private attachCameraVideo(): void {
+    if (!this.scanCameraActive || !this.scanCameraStream) {
+      return;
+    }
+
+    const video = this.root.querySelector<HTMLVideoElement>(".scan-video");
+
+    if (!video || video.srcObject === this.scanCameraStream) {
+      return;
+    }
+
+    video.srcObject = this.scanCameraStream;
+    void video.play().catch(() => {
+      this.scanMessage = "La caméra est ouverte, mais la lecture vidéo n'a pas démarré.";
+    });
+  }
+
+  private startScanLoop(): void {
+    if (!this.scanCameraActive) {
+      return;
+    }
+
+    const tick = () => {
+      if (!this.scanCameraActive) {
+        return;
+      }
+
+      this.scanFrameTick += 1;
+      this.scanCaptureCooldown = Math.max(0, this.scanCaptureCooldown - 1);
+
+      if (this.scanFrameTick % 10 === 0) {
+        this.inspectCameraFrame();
+      }
+
+      this.scanFrameId = window.requestAnimationFrame(tick);
+    };
+
+    this.scanFrameId = window.requestAnimationFrame(tick);
+  }
+
+  private inspectCameraFrame(): void {
+    const video = this.root.querySelector<HTMLVideoElement>(".scan-video");
+
+    if (!video || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+      return;
+    }
+
+    try {
+      const sample = sampleFaceletsFromVideo(video, { frameScale: this.scanFrameScale });
+      const signature = sample.colors.join("");
+      this.scanConfidence = sample.confidence;
+      this.scanQuality = sample.quality;
+      this.scanWarnings = sample.warnings;
+      this.scanLiveColors = sample.colors;
+      this.scanLiveCellConfidences = sample.cellConfidences;
+      this.scanDetectedFace =
+        sample.centerConfidence >= 0.48 ? (FACE_BY_CENTER_COLOR[sample.centerColor] ?? null) : null;
+      const stable =
+        this.scanSignatureDistance(signature, this.scanLastSignature) <= 1 &&
+        this.isSampleAutoReady(sample);
+      this.scanStableFrames = stable
+        ? Math.min(this.scanStableTarget, this.scanStableFrames + 1)
+        : 0;
+      this.scanLastSignature = signature;
+
+      if (
+        this.scanAutoCapture &&
+        this.scanStableFrames >= this.scanStableTarget &&
+        this.scanCaptureCooldown === 0
+      ) {
+        this.commitScanSample(sample, "Auto-capture", true);
+        return;
+      }
+
+      this.updateCameraStatusDom();
+    } catch {
+      this.scanConfidence = 0;
+      this.scanQuality = 0;
+      this.scanStableFrames = 0;
+      this.scanDetectedFace = null;
+      this.scanWarnings = ["image caméra inexploitable"];
+      this.updateCameraStatusDom();
+    }
+  }
+
+  private updateCameraStatusDom(): void {
+    const confidence = this.root.querySelector<HTMLElement>("[data-scan-confidence]");
+    const stability = this.root.querySelector<HTMLElement>("[data-scan-stability]");
+    const quality = this.root.querySelector<HTMLElement>("[data-scan-quality]");
+    const qualityBar = this.root.querySelector<HTMLElement>("[data-scan-quality-bar]");
+    const warnings = this.root.querySelector<HTMLElement>("[data-scan-warnings]");
+
+    if (confidence) {
+      confidence.textContent = `${Math.round(this.scanQuality * 100)}%`;
+    }
+
+    if (stability) {
+      stability.textContent = `${this.scanDetectedFace ? `${this.scanDetectedFace} · ` : ""}${this.scanStableFrames}/${this.scanStableTarget} stable`;
+    }
+
+    if (quality) {
+      quality.textContent = this.scanQuality > 0 ? `${Math.round(this.scanQuality * 100)}%` : "-";
+    }
+
+    if (qualityBar) {
+      qualityBar.style.width = `${Math.round(this.scanQuality * 100)}%`;
+    }
+
+    if (warnings) {
+      warnings.innerHTML = this.scanWarnings
+        .map((warning) => `<span>${escapeHtml(warning)}</span>`)
+        .join("");
+    }
+
+    this.root.querySelectorAll<HTMLElement>(".camera-grid i").forEach((cell, index) => {
+      const color = this.scanLiveColors[index] ?? "X";
+      const confidence = this.scanLiveCellConfidences[index] ?? 0;
+      cell.style.setProperty("--live-color", COLOR_META[color].hex);
+      cell.style.setProperty("--live-opacity", color === "X" ? "0" : "0.72");
+      cell.dataset.label = color === "X" ? "" : COLOR_META[color].short;
+      cell.classList.toggle("is-weak", color !== "X" && confidence < 0.42);
+    });
+  }
+
+  private isSampleAutoReady(sample: FaceletSample): boolean {
+    const centerFace = FACE_BY_CENTER_COLOR[sample.centerColor];
+
+    return Boolean(
+      centerFace &&
+        sample.centerConfidence >= 0.48 &&
+        sample.quality >= this.scanAutoQualityThreshold &&
+        sample.colors.every((color) => color !== "X"),
+    );
+  }
+
+  private scanSignatureDistance(next: string, previous: string): number {
+    if (!previous || next.length !== previous.length) {
+      return Number.POSITIVE_INFINITY;
+    }
+
+    return next.split("").reduce((distance, char, index) => {
+      return distance + (char === previous[index] ? 0 : 1);
+    }, 0);
+  }
+
+  private captureCameraFace(): void {
+    const video = this.root.querySelector<HTMLVideoElement>(".scan-video");
+
+    if (!video || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+      this.scanMessage = "Attends que la caméra affiche le cube.";
+      this.render();
+      return;
+    }
+
+    try {
+      const sample = sampleFaceletsFromVideo(video, { frameScale: this.scanFrameScale });
+      this.commitScanSample(sample, "Capture", false);
+    } catch (error) {
+      this.scanMessage = error instanceof Error ? error.message : "Capture caméra impossible.";
+      this.render();
+    }
+  }
+
+  private commitScanSample(sample: FaceletSample, sourceLabel: string, auto: boolean): void {
+    const targetFace = this.resolveSampleTargetFace(sample);
+    const routed = targetFace !== this.scanFace;
+    const colors = [...sample.colors];
+    colors[4] = FACE_SCAN_COLOR[targetFace];
+    const nextGrid = cloneScanGrid(this.scanGrid);
+    nextGrid[targetFace] = colors;
+    this.scanGrid = nextGrid;
+    this.scanPhotos[targetFace] = sample.dataUrl;
+    this.scanConfidence = sample.confidence;
+    this.scanQuality = sample.quality;
+    this.scanWarnings = [...sample.warnings];
+    if (sample.centerConfidence < 0.5 && !this.scanWarnings.includes("centre à vérifier")) {
+      this.scanWarnings.push("centre à vérifier");
+    }
+    this.scanDetectedFace = targetFace;
+    this.scanLiveColors = sample.colors;
+    this.scanLiveCellConfidences = sample.cellConfidences;
+    this.scanCaptureCooldown = 40;
+    this.scanStableFrames = 0;
+    this.scanAutoCapture = false;
+    const routedText = routed
+      ? ` reconnue comme face ${targetFace} grâce au centre ${COLOR_META[FACE_SCAN_COLOR[targetFace]].label}`
+      : ` ${targetFace}`;
+    const warningText =
+      this.scanWarnings.length > 0 ? ` À vérifier: ${this.scanWarnings.join(", ")}.` : "";
+    const captureState = colors.every((color) => color !== "X") ? "validée" : "capturée";
+    const autoText = auto ? " Auto coupée pour cette face." : "";
+    this.scanMessage = `${sourceLabel}${routedText} ${captureState} (${Math.round(sample.quality * 100)}% fiable).${autoText} Corrige si besoin, puis passe à la suivante.${warningText}`;
+    this.scanFace = targetFace;
+    this.scanPaint = FACE_SCAN_COLOR[targetFace];
+
+    this.render();
+  }
+
+  private resolveSampleTargetFace(sample: FaceletSample): Face {
+    const detectedFace = FACE_BY_CENTER_COLOR[sample.centerColor];
+
+    if (detectedFace && sample.centerConfidence >= 0.5) {
+      return detectedFace;
+    }
+
+    return this.scanFace;
+  }
+
+  private scanFrameInset(): string {
+    return `${((1 - this.scanFrameScale) * 50).toFixed(1)}%`;
+  }
+
+  private nextIncompleteScanFace(fromFace = this.scanFace): Face {
+    const currentIndex = SCAN_FACE_ORDER.indexOf(fromFace);
+
+    for (let offset = 1; offset <= SCAN_FACE_ORDER.length; offset += 1) {
+      const face = SCAN_FACE_ORDER[(currentIndex + offset) % SCAN_FACE_ORDER.length];
+
+      if (this.scanGrid[face].some((color) => color === "X")) {
+        return face;
+      }
+    }
+
+    return this.nextScanFace();
   }
 
   private restartAdaptivePlan(): void {
@@ -987,6 +1462,10 @@ function clampIndex(index: number, length: number): number {
   }
 
   return Math.min(Math.max(index, 0), Math.max(0, length - 1));
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
 }
 
 function escapeHtml(value: string): string {
